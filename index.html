@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Game of Life</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #000;
+        overflow: hidden;
+      }
+      canvas {
+        width: min(100vh, 100vw);
+        height: min(100vh, 100vw);
+      }
+      button {
+        position: fixed;
+        top: 0;
+        padding: 1rem 2rem;
+        font-size: 2rem;
+        background: transparent;
+        border: 0;
+        color: #fff;
+        outline: 0;
+        font-family: monospace;
+        cursor: pointer;
+        z-index: 3;
+
+        transition: transform 0.1s ease;
+      }
+
+      #next {
+        left: 0;
+      }
+
+      #autoplay {
+        right: 0;
+      }
+
+      button:hover {
+        transform: scale(1.05);
+      }
+
+      button:active {
+        transform: scale(0.95);
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas" width="800" height="600"></canvas>
+
+    <button id="next" type="button">Next</button>
+    <button id="autoplay" type="button">Autoplay On</button>
+
+    <script>
+      const canvas = document.getElementById("canvas");
+      const gl = canvas.getContext("webgl");
+
+      gl.getExtension("OES_texture_float");
+
+      const RESOLUTION = 64;
+      const CELL_SIZE = 1 / RESOLUTION;
+
+      const vertices = new Float32Array([
+        // bottom left
+        -1, -1,
+        // bottom right
+        1, -1,
+        // top left
+        -1, 1,
+        // top right
+        1, 1,
+      ]);
+
+      function createProgram(vertexShader, fragmentShader) {
+        const program = gl.createProgram();
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          console.error(gl.getProgramInfoLog(program));
+        }
+        return program;
+      }
+
+      function createShader(type, src) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, src);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+          console.error(gl.getShaderInfoLog(shader));
+        return shader;
+      }
+
+      function createFramebuffer(texture) {
+        const framebuffer = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          texture,
+          0,
+        );
+        return framebuffer;
+      }
+
+      function createSimulationTexture(w, h) {
+        gl.activeTexture(gl.TEXTURE0);
+        let texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          w,
+          h,
+          0,
+          gl.RGBA,
+          gl.FLOAT,
+          null,
+        );
+
+        return texture;
+      }
+
+      const screenRenderBuffer = gl.createBuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, screenRenderBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+      function draw(program, framebuffer, setupUniforms) {
+        gl.useProgram(program);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+        gl.bindBuffer(gl.ARRAY_BUFFER, screenRenderBuffer);
+
+        const posLoc = gl.getAttribLocation(program, "a_position");
+        gl.enableVertexAttribArray(posLoc);
+        gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+        gl.uniform2f(
+          gl.getUniformLocation(program, "u_grid_size"),
+          RESOLUTION,
+          RESOLUTION,
+        );
+
+        setupUniforms();
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+
+      const vertexShader = createShader(
+        gl.VERTEX_SHADER,
+        `
+            precision highp float;
+            attribute vec2 a_position;
+            
+            varying vec2 v_uv;
+
+            void main() {
+                v_uv = a_position / 2.0 + 0.5;
+
+                gl_Position = vec4(a_position, 0.0, 1.0);
+            }
+        `,
+      );
+
+      const drawingProgram = createProgram(
+        vertexShader,
+        createShader(
+          gl.FRAGMENT_SHADER,
+          `
+            precision highp float;
+            precision highp sampler2D;
+
+            varying vec2 v_uv;
+            uniform vec2 u_grid_size;
+            uniform vec2 u_click_position;
+            uniform sampler2D u_texture;
+
+            void main() {
+              vec2 grid_position = floor(v_uv * u_grid_size);
+
+              float isClicked = float(all(equal(grid_position, u_click_position)));
+
+              gl_FragColor = mix(texture2D(u_texture, v_uv), vec4(1.0), isClicked);
+            }
+        `,
+        ),
+      );
+
+      const stepProgram = createProgram(
+        vertexShader,
+        createShader(
+          gl.FRAGMENT_SHADER,
+          `
+            precision highp float;
+            precision highp sampler2D;
+
+            varying vec2 v_uv;
+            uniform vec2 u_grid_size;
+            uniform sampler2D u_texture;
+
+            void main() {
+              vec2 grid_position = floor(v_uv * u_grid_size);
+
+              vec2 top         = grid_position + vec2( 0.0,  1.0);
+              vec2 topRight    = grid_position + vec2( 1.0,  1.0);
+              vec2 right       = grid_position + vec2( 1.0,  0.0);
+              vec2 bottomRight = grid_position + vec2( 1.0, -1.0);
+              vec2 bottom      = grid_position + vec2( 0.0, -1.0);
+              vec2 bottomLeft  = grid_position + vec2(-1.0, -1.0);
+              vec2 left        = grid_position + vec2(-1.0,  0.0);
+              vec2 topLeft     = grid_position + vec2(-1.0,  1.0);
+
+              float aliveNeighborsCount = (
+                texture2D(u_texture, top         / u_grid_size).r +
+                texture2D(u_texture, topRight    / u_grid_size).r +
+                texture2D(u_texture, right       / u_grid_size).r +
+                texture2D(u_texture, bottomRight / u_grid_size).r +
+                texture2D(u_texture, bottom      / u_grid_size).r +
+                texture2D(u_texture, bottomLeft  / u_grid_size).r +
+                texture2D(u_texture, left        / u_grid_size).r +
+                texture2D(u_texture, topLeft     / u_grid_size).r
+              );
+              bool isAlive = texture2D(u_texture, v_uv).r == 1.0;
+
+              bool stablePopulation = aliveNeighborsCount >= 2.0 && aliveNeighborsCount <= 3.0 && isAlive;
+              bool reproduction = aliveNeighborsCount == 3.0;
+
+              gl_FragColor = vec4(float(stablePopulation || reproduction));
+            }
+        `,
+        ),
+      );
+
+      const renderProgram = createProgram(
+        vertexShader,
+        createShader(
+          gl.FRAGMENT_SHADER,
+          `
+            precision highp float;
+            precision highp sampler2D;
+
+            varying vec2 v_uv;
+            uniform sampler2D u_texture;
+
+            void main() {
+                gl_FragColor = texture2D(u_texture, v_uv);
+            }
+        `,
+        ),
+      );
+
+      let canvasTextureA = createSimulationTexture(RESOLUTION, RESOLUTION);
+      let canvasTextureB = createSimulationTexture(RESOLUTION, RESOLUTION);
+      let canvasBufferA = createFramebuffer(canvasTextureA);
+      let canvasBufferB = createFramebuffer(canvasTextureB);
+
+      let isAutoplay = false;
+      const STEP_MS = 100;
+      let lastStepTime = 0;
+
+      function raf(time) {
+        if (isAutoplay && time - lastStepTime > STEP_MS) {
+          lastStepTime = time;
+
+          gl.viewport(0, 0, RESOLUTION, RESOLUTION);
+
+          draw(stepProgram, canvasBufferB, () => {
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, canvasTextureA);
+            gl.uniform1i(gl.getUniformLocation(stepProgram, "u_texture"), 0);
+          });
+
+          [canvasTextureA, canvasTextureB] = [canvasTextureB, canvasTextureA];
+          [canvasBufferA, canvasBufferB] = [canvasBufferB, canvasBufferA];
+        }
+
+        gl.viewport(0, 0, canvas.width, canvas.height);
+
+        draw(renderProgram, null, () => {
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, canvasTextureA);
+          gl.uniform1i(gl.getUniformLocation(renderProgram, "u_texture"), 0);
+        });
+
+        requestAnimationFrame(raf);
+      }
+
+      function drawCell(event) {
+        const box = canvas.getBoundingClientRect();
+        const x = event.x - box.x;
+        const y = event.y - box.y;
+
+        const mouseX = x / box.width;
+        const mouseY = 1 - y / box.height;
+
+        gl.viewport(0, 0, RESOLUTION, RESOLUTION);
+
+        draw(drawingProgram, canvasBufferB, () => {
+          gl.uniform2f(
+            gl.getUniformLocation(drawingProgram, "u_click_position"),
+            Math.floor(mouseX * RESOLUTION),
+            Math.floor(mouseY * RESOLUTION),
+          );
+
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, canvasTextureA);
+          gl.uniform1i(gl.getUniformLocation(drawingProgram, "u_texture"), 0);
+        });
+        [canvasTextureA, canvasTextureB] = [canvasTextureB, canvasTextureA];
+        [canvasBufferA, canvasBufferB] = [canvasBufferB, canvasBufferA];
+      }
+
+      canvas.addEventListener("touchmove", (event) =>
+        drawCell({
+          x: event.touches[0].clientX,
+          y: event.touches[0].clientY,
+        }),
+      );
+
+      let isMouseDown = false;
+
+      document.addEventListener("mousedown", (event) => {
+        isMouseDown = true;
+      });
+      document.addEventListener("mouseup", (event) => {
+        isMouseDown = false;
+      });
+      document.addEventListener("mousemove", (event) => {
+        if (isMouseDown) {
+          drawCell({ x: event.clientX, y: event.clientY });
+        }
+      });
+
+      document.getElementById("next").addEventListener("click", () => {
+        gl.viewport(0, 0, RESOLUTION, RESOLUTION);
+
+        draw(stepProgram, canvasBufferB, () => {
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, canvasTextureA);
+          gl.uniform1i(gl.getUniformLocation(stepProgram, "u_texture"), 0);
+        });
+        [canvasTextureA, canvasTextureB] = [canvasTextureB, canvasTextureA];
+        [canvasBufferA, canvasBufferB] = [canvasBufferB, canvasBufferA];
+      });
+
+      document.getElementById("autoplay").addEventListener("click", () => {
+        isAutoplay = !isAutoplay;
+        document.getElementById("autoplay").textContent = isAutoplay
+          ? "Autoplay On"
+          : "Autoplay Off";
+      });
+
+      requestAnimationFrame(raf);
+    </script>
+  </body>
+</html>
